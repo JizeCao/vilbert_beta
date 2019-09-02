@@ -29,55 +29,55 @@ def converId(img_id):
 image_path = {}
 path2id = {}
 metadata_path = {}
-with open('train.jsonl', 'rb') as f: # opening file in binary(rb) mode    
+with open('../data/VCR/train.jsonl', 'rb') as f: # opening file in binary(rb) mode
     for item in json_lines.reader(f):
-        if item['img_fn'] not in image_path:
-            image_path[item['img_fn']] = 1
+        img_fn = item['img_fn'].split('/')[-1]
+        if img_fn not in image_path:
+            image_path[img_fn] = 1
             img_id = item['img_id']
             metadata_path[item['metadata_fn']] = 1
-            path2id[item['img_fn']] = converId(item['img_id'])
+            path2id[img_fn] = converId(item['img_id'])
 
-with open('val.jsonl', 'rb') as f: # opening file in binary(rb) mode    
+with open('../data/VCR/val.jsonl', 'rb') as f: # opening file in binary(rb) mode
     for item in json_lines.reader(f):
-        if item['img_fn'] not in image_path:
-            image_path[item['img_fn']] = 1
-            path2id[item['img_fn']] = converId(item['img_id'])
+        img_fn = item['img_fn'].split('/')[-1]
+        if img_fn not in image_path:
+            image_path[img_fn] = 1
+            img_id = item['img_id']
             metadata_path[item['metadata_fn']] = 1
+            path2id[img_fn] = converId(item['img_id'])
 
-with open('test.jsonl', 'rb') as f: # opening file in binary(rb) mode    
+with open('../data/VCR/test.jsonl', 'rb') as f: # opening file in binary(rb) mode
     for item in json_lines.reader(f):
-        if item['img_fn'] not in image_path:
-            image_path[item['img_fn']] = 1
-            path2id[item['img_fn']] = converId(item['img_id'])
+        img_fn = item['img_fn'].split('/')[-1]
+        if img_fn not in image_path:
+            image_path[img_fn] = 1
+            img_id = item['img_id']
             metadata_path[item['metadata_fn']] = 1
+            path2id[img_fn] = converId(item['img_id'])
 
 count = 0
 num_file = 4
-name = '/srv/share2/jlu347/bottom-up-attention/feature/VCR/VCR_gt_resnet101_faster_rcnn_genome.tsv.%d'
-infiles = [name % i for i in range(num_file)]
-length = len(image_path)
-print("total length is %d" %length)
-
-count = 0
-num_file = 4
-name = '/srv/share2/jlu347/bottom-up-attention/feature/VCR/VCR_gt_resnet101_faster_rcnn_genome.tsv.%d'
-infiles = [name % i for i in range(num_file)]
+name = '../data/VCR/VCR_gt_resnet101_faster_rcnn_genome.tsv.0'
+# infiles = [name % i for i in range(num_file)]
+infiles = [name]
 
 id_list = []
-save_path = os.path.join('VCR_gt_resnet101_faster_rcnn_genome.lmdb')
+save_path = os.path.join('../data/VCR/VCR_gt_resnet101_faster_rcnn_genome.lmdb')
 env = lmdb.open(save_path, map_size=1099511627776)
 with env.begin(write=True) as txn:
 
     for infile in infiles:
         with open(infile) as tsv_in_file:
-            reader = csv.DictReader(tsv_in_file, delimiter='\t', fieldnames = FIELDNAMES)
+            reader = csv.DictReader(tsv_in_file, delimiter='\t', fieldnames=FIELDNAMES)
             for item in reader:
-                img_id = str(path2id[item['image_id']]).encode()
+                img_id = str(path2id[item['image_id'] + '.jpg']).encode()
                 id_list.append(img_id)
-                # txn.put(img_id, pickle.dumps(item))
+                txn.put(img_id, pickle.dumps(item))
                 if count % 1000 == 0:
                     print(count)
                 count += 1
     txn.put('keys'.encode(), pickle.dumps(id_list))
+
 print(count)
-json.dump(path2id, open('VCR_gt_ImagePath2Id.json', 'w'))
+json.dump(path2id, open('../data/VCR/VCR_gt_ImagePath2Id.json', 'w'))

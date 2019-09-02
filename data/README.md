@@ -34,7 +34,7 @@ For **Downstream Tasks**:
 
 we use the default pytorch dataloader to load the Downstream tasks, consider use the following script to convert the `tsv` file to `lmdb`. 
 
-```bash
+```bashe
 scripts/convert_lmdb_VCR.py
 scripts/convert_lmdb_VCR_gt.py
 ```

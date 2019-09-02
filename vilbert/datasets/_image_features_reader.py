@@ -6,6 +6,7 @@ import copy
 import pickle
 import lmdb # install lmdb by "pip install lmdb"
 import base64
+import ast
 import pdb
 
 class ImageFeaturesH5Reader(object):
@@ -54,7 +55,10 @@ class ImageFeaturesH5Reader(object):
         return len(self._image_ids)
 
     def __getitem__(self, image_id):
-        image_id = str(image_id).encode()
+        # if use absolute path
+        image_id = str(image_id)
+        # image_id = str(image_id).split('/')[-1] + '.jpg'
+        image_id = image_id.encode()
         index = self._image_ids.index(image_id)
         if self._in_memory:
             # Load features during first epoch, all not loaded together as it
@@ -72,8 +76,8 @@ class ImageFeaturesH5Reader(object):
                     image_w = int(item['image_w'])
                     num_boxes = int(item['num_boxes'])
 
-                    features = np.frombuffer(base64.b64decode(item["features"]), dtype=np.float32).reshape(num_boxes, 2048)
-                    boxes = np.frombuffer(base64.b64decode(item['boxes']), dtype=np.float32).reshape(num_boxes, 4)
+                    features = np.frombuffer(base64.b64decode(ast.literal_eval(item["features"])), dtype=np.float32).reshape(num_boxes, 2048)
+                    boxes = np.frombuffer(base64.b64decode(ast.literal_eval(item['boxes'])), dtype=np.float32).reshape(num_boxes, 4)
                     
                     g_feat = np.sum(features, axis=0) / num_boxes
                     num_boxes = num_boxes + 1
@@ -108,9 +112,8 @@ class ImageFeaturesH5Reader(object):
                 image_h = int(item['image_h'])
                 image_w = int(item['image_w'])
                 num_boxes = int(item['num_boxes'])
-
-                features = np.frombuffer(base64.b64decode(item["features"]), dtype=np.float32).reshape(num_boxes, 2048)
-                boxes = np.frombuffer(base64.b64decode(item['boxes']), dtype=np.float32).reshape(num_boxes, 4)
+                features = np.frombuffer(base64.b64decode(ast.literal_eval(item["features"])), dtype=np.float32).reshape(num_boxes, 2048)
+                boxes = np.frombuffer(base64.b64decode(ast.literal_eval(item['boxes'])), dtype=np.float32).reshape(num_boxes, 4)
                 g_feat = np.sum(features, axis=0) / num_boxes
                 num_boxes = num_boxes + 1
                 features = np.concatenate([np.expand_dims(g_feat, axis=0), features], axis=0)

@@ -96,7 +96,8 @@ class VCRDataset(Dataset):
         tokenizer: BertTokenizer,
         padding_index: int = 0,
         max_seq_length: int = 40,
-        max_region_num: int = 60
+        max_region_num: int = 60,
+        pointer_sensitive = False
     ):
         # All the keys in `self._entries` would be present in `self._image_features_reader`
         if task == 'VCR_Q-A':
@@ -114,6 +115,7 @@ class VCRDataset(Dataset):
         self._max_caption_length = max_seq_length
         self._max_region_num = max_region_num
         self.num_labels = 1
+        self._pointer_sensitive = pointer_sensitive
 
         self._names = []
         with open('data/VCR/unisex_names_table.csv') as csv_file:
@@ -266,6 +268,16 @@ class VCRDataset(Dataset):
                 tokens_b.pop()
                 mask_b.pop()
 
+    # TODO
+    def _get_aligned_visual_feat(self, co_attention_mask, visual_features, zero_out=True):
+        co_attention_mask = torch.LongTensor(co_attention_mask)
+        pointers = torch.nonzero(torch.LongTensor(co_attention_mask) != -1)
+        if zero_out:
+            aligned_feat = torch.zeros(4, self._max_caption_length, visual_features.shape[1])
+        for pointer in pointers:
+            aligned_feat[pointer[0], pointer[1]] = visual_features[co_attention_mask[pointer[0], pointer[1]]]
+        return aligned_feat
+
     def __getitem__(self, index):
         
         entry = self._entries[index]
@@ -278,7 +290,7 @@ class VCRDataset(Dataset):
 
         gt_features, gt_num_boxes, gt_boxes, _ = self._gt_image_features_reader[image_id]
 
-        # merge two features.
+        # merge two features for whole image feat vector (which is calculated through the image feat)
         features[0] = (features[0] * num_boxes + gt_features[0] * gt_num_boxes) / (num_boxes + gt_num_boxes)
 
         # merge two boxes, and assign the labels. 
@@ -320,9 +332,15 @@ class VCRDataset(Dataset):
         segment_ids = entry["segment_ids"]
         target = int(entry["target"])
 
-        if self._split == 'test':
-            # anno_id = entry["anno_id"]
-            anno_id = 0#entry["anno_id"]
+        # TODO aligned features
+        # if self._pointer_sensitive:
+        #     aligned_visual_feat = self._get_aligned_visual_feat(entry["co_attention_mask"], features)
+        # else:
+        #     aligned_visual_feat = None
+
+        if self._split == 'test' or self._split == 'val':
+            anno_id = entry["anno_id"]
+            # anno_id = 0 #entry["anno_id"]
         else:
             anno_id = entry["img_id"]
 
@@ -335,6 +353,8 @@ class VCRDataset(Dataset):
                     co_attention_mask[ii, idx+num_box_preserve, jj] = 1
 
         return features, spatials, image_mask, input_ids, target, input_mask, segment_ids, co_attention_mask, anno_id
+        # return features, spatials, image_mask, input_ids, target, input_mask, segment_ids, co_attention_mask, anno_id, \
+        #        aligned_visual_feat
 
     def __len__(self):
         return len(self._entries)

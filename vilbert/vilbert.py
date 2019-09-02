@@ -164,7 +164,8 @@ class BertConfig(object):
         in_batch_pairs=False,
         fusion_method="mul",
         intra_gate=False,
-        with_coattention=True
+        with_coattention=True,
+        pointer_sensitive=False
     ):
 
         """Constructs BertConfig.
@@ -233,6 +234,7 @@ class BertConfig(object):
             self.fast_mode = fast_mode
             self.fixed_v_layer = fixed_v_layer
             self.fixed_t_layer = fixed_t_layer
+            self.pointer_sensitive = pointer_sensitive
             
             self.in_batch_pairs = in_batch_pairs
             self.fusion_method = fusion_method
@@ -1299,7 +1301,7 @@ class BertModel(BertPreTrainedModel):
     ```
     """
 
-    def __init__(self, config):
+    def __init__(self, config: BertConfig):
         super(BertModel, self).__init__(config)
 
         # initilize word embedding
@@ -1311,6 +1313,9 @@ class BertModel(BertPreTrainedModel):
         self.encoder = BertEncoder(config)
         self.t_pooler = BertTextPooler(config)
         self.v_pooler = BertImagePooler(config)
+        if config.pointer_sensitive:
+            self.fuse_pointer_feat = True
+            self.vTol = nn.Linear(config.v_hidden_size, config.hidden_size)
 
         self.apply(self.init_bert_weights)
 
@@ -1325,6 +1330,7 @@ class BertModel(BertPreTrainedModel):
         co_attention_mask=None,
         output_all_encoded_layers=False,
         output_all_attention_masks=False,
+        correspond_pointer_feat=None
     ):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_txt)
@@ -1370,6 +1376,9 @@ class BertModel(BertPreTrainedModel):
         )  # fp16 compatibility
 
         embedding_output = self.embeddings(input_txt, token_type_ids)
+        if correspond_pointer_feat is not None and self.fuse_pointer_feat:
+            embedding_output = embedding_output + self.vTol(correspond_pointer_feat)
+
         v_embedding_output = self.v_embeddings(input_imgs, image_loc)
 
         encoded_layers_t, encoded_layers_v, all_attention_mask = self.encoder(
@@ -1527,6 +1536,7 @@ class VILBertForVLTasks(BertPreTrainedModel):
         image_attention_mask=None,
         co_attention_mask=None,
         output_all_encoded_layers=False,
+        correspond_pointer_feat=None
     ):
         sequence_output_t, sequence_output_v, pooled_output_t, pooled_output_v, _ = self.bert(
             input_txt,
@@ -1537,6 +1547,7 @@ class VILBertForVLTasks(BertPreTrainedModel):
             image_attention_mask,
             co_attention_mask,
             output_all_encoded_layers=False,
+            correspond_pointer_feat=correspond_pointer_feat
         )
 
         vil_prediction = 0

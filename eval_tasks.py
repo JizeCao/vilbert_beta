@@ -17,6 +17,7 @@ import pdb
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+from tqdm import tqdm
 
 from pytorch_pretrained_bert.optimization import BertAdam, WarmupLinearSchedule
 from vilbert.task_utils import LoadDatasetEval, LoadLosses, ForwardModelsTrain, ForwardModelsVal, EvaluatingModel
@@ -198,13 +199,13 @@ def main():
     no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
 
     print("  Num Iters: ", task_num_iters)
-    print("  Batch size: ", task_batch_size)    
+    print("  Batch size: ", task_batch_size)
 
     model.eval()
     for task_id in task_ids:
         results = []
         others = []
-        for i, batch in enumerate(task_dataloader_val[task_id]):
+        for i, batch in tqdm(enumerate(task_dataloader_val[task_id])):
             loss, score, batch_size, results, others = EvaluatingModel(args, task_cfg, device, \
                     task_id, batch, model, task_dataloader_val, task_losses, results, others)
 

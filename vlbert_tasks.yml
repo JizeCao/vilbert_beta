@@ -28,10 +28,11 @@ TASK1:
   val_annotations_jsonpath: data/VCR/val.jsonl
   max_seq_length: 60
   max_region_num: 100
-  batch_size: 48
+  batch_size: 64
   train_split: train
   val_split: val
   lr: 0.00002
+  pointer_sensitive: true
   num_epoch: 20
 TASK2:
   name: VCR_QA-R

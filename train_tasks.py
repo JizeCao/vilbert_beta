@@ -2,32 +2,31 @@ import argparse
 import json
 import logging
 import os
-import random
-from io import open
-import numpy as np
-
-from tensorboardX import SummaryWriter
-from tqdm import tqdm
-from bisect import bisect
-import yaml
-from easydict import EasyDict as edict
-
 import pdb
+import random
 import sys
+from bisect import bisect
+from io import open
+
+import numpy as np
+from vilbert.utils import all_reduce_and_rescale_tensors
 import torch
-import torch.nn.functional as F
+import torch.distributed as dist
 import torch.nn as nn
-
+import torch.nn.functional as F
+import yaml
+from apex import amp
+from easydict import EasyDict as edict
 from pytorch_pretrained_bert.optimization import WarmupLinearSchedule
-
-# from parallel.parallel import DataParallelModel, DataParallelCriterion
-
-from vilbert.task_utils import LoadDatasets, LoadLosses, ForwardModelsTrain, ForwardModelsVal
-from vilbert.optimization import BertAdam, Adam, Adamax
+from tensorboardX import SummaryWriter
 from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
+from tqdm import tqdm
 
 import vilbert.utils as utils
-import torch.distributed as dist
+from vilbert.optimization import BertAdam, Adam, Adamax
+from vilbert.task_utils import LoadDatasets, LoadLosses, ForwardModelsTrain, ForwardModelsVal
+
+# from parallel.parallel import DataParallelModel, DataParallelCriterion
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
@@ -162,7 +161,7 @@ def main():
     # torch.manual_seed(args.seed)
 
     if args.baseline:
-        from pytorch_pretrained_bert.modeling import BertConfig
+        from vilbert.basebert import BertConfig
         from vilbert.basebert import BaseBertForVLTasks
     elif args.compact:
         from vilbert.vilbert_compact import BertConfig
@@ -226,7 +225,7 @@ def main():
 
     config = BertConfig.from_json_file(args.config_file)
     if default_gpu:
-        # save all the hidden parameters. 
+        # save all the hidden parameters.
         with open(os.path.join(savePath, 'command.txt'), 'w') as f:
             print(args, file=f)  # Python 3.x
             print('\n', file=f)
@@ -238,7 +237,7 @@ def main():
     tbLogger = utils.tbLogger(timeStamp, savePath, task_names, task_ids, task_num_iters, args.gradient_accumulation_steps)
 
     # if n_gpu > 0:
-        # torch.cuda.manual_seed_all(args.seed)
+    #     torch.cuda.manual_seed_all(args.seed)
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
@@ -251,6 +250,7 @@ def main():
     for task_id, num_iter in task_num_iters.items():
         task_start_iter[task_id] = num_train_optimization_steps - (task_cfg[task]['num_epoch'] * num_iter // args.gradient_accumulation_steps)
         task_interval[task_id] = num_train_optimization_steps // (task_cfg[task]['num_epoch'] * num_iter // args.gradient_accumulation_steps)
+    # num_labels = 4
 
     if args.baseline:
         model = BaseBertForVLTasks.from_pretrained(
@@ -261,43 +261,9 @@ def main():
             args.from_pretrained, config, num_labels=num_labels, default_gpu=default_gpu
             )
 
-    task_losses = LoadLosses(args, task_cfg, args.tasks.split('-'))
-    model.to(device)
-    if args.local_rank != -1:
-        try:
-            from apex.parallel import DistributedDataParallel as DDP
-        except ImportError:
-            raise ImportError(
-                "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training."
-            )
-        model = DDP(model, delay_allreduce=True)
-
-    elif n_gpu > 1:
-        model = torch.nn.DataParallel(model)
-
-    no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
-
-    if args.freeze != -1:
-        bert_weight_name_filtered = []
-        for name in bert_weight_name:
-            if 'embeddings' in name:
-                bert_weight_name_filtered.append(name)
-            elif 'encoder' in name:
-                layer_num = name.split('.')[2]
-                if int(layer_num) <= args.freeze:
-                    bert_weight_name_filtered.append(name)
-        
-        optimizer_grouped_parameters = []
-        for key, value in dict(model.named_parameters()).items():
-            if key[12:] in bert_weight_name_filtered:
-                value.requires_grad = False
-            
-        if default_gpu:
-            print("filtered weight")
-            print(bert_weight_name_filtered)
-
+    # Config optimizer
     optimizer_grouped_parameters = []
-    lr = args.learning_rate
+    no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
     for key, value in dict(model.named_parameters()).items():
         if value.requires_grad:
             if 'vil_prediction' in key:
@@ -319,13 +285,6 @@ def main():
                 optimizer_grouped_parameters += [
                     {"params": [value], "lr": lr, "weight_decay": 0.0}
                 ]
-
-    if default_gpu:
-        print(len(list(model.named_parameters())), len(optimizer_grouped_parameters))
-
-    max_num_iter = max(task_num_iters.values())
-    max_batch_size = max(task_batch_size.values())
-    
     if args.optimizer == 'BertAdam':
         optimizer = BertAdam(
             optimizer_grouped_parameters,
@@ -349,27 +308,72 @@ def main():
             warmup=args.warmup_proportion,
             t_total=num_train_optimization_steps,
             schedule='warmup_constant',
-        )        
+        )
 
     if args.lr_scheduler == 'automatic':
         lr_scheduler = ReduceLROnPlateau(optimizer, \
                         mode='max',
-                        factor=0.2, 
-                        patience=1, 
+                        factor=0.2,
+                        patience=1,
                         cooldown=1,
                         threshold=0.001)
     elif args.lr_scheduler == 'mannul':
         lr_reduce_list = np.array([12, 16])
-        # lr_reduce_list = np.array([6, 8, 10])        
+        # lr_reduce_list = np.array([6, 8, 10])
         def lr_lambda_fun(epoch):
             return pow(0.1, np.sum(lr_reduce_list <= epoch))
         lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda_fun)
+
+    model.to(device)
+    model, optimizer = amp.initialize(model, optimizer,
+                                      enabled=args.fp16, opt_level='O2')
+    task_losses = LoadLosses(args, task_cfg, args.tasks.split('-'))
+    if args.local_rank != -1:
+        try:
+            from apex.parallel import DistributedDataParallel as DDP
+        except ImportError:
+            raise ImportError(
+                "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training."
+            )
+        model = DDP(model, delay_allreduce=True)
+
+    elif n_gpu > 1:
+        model = torch.nn.DataParallel(model)
+
+
+    if args.freeze != -1:
+        bert_weight_name_filtered = []
+        for name in bert_weight_name:
+            if 'embeddings' in name:
+                bert_weight_name_filtered.append(name)
+            elif 'encoder' in name:
+                layer_num = name.split('.')[2]
+                if int(layer_num) <= args.freeze:
+                    bert_weight_name_filtered.append(name)
+        
+        optimizer_grouped_parameters = []
+        for key, value in dict(model.named_parameters()).items():
+            if key[12:] in bert_weight_name_filtered:
+                value.requires_grad = False
+            
+        if default_gpu:
+            print("filtered weight")
+            print(bert_weight_name_filtered)
+
+
+    if default_gpu:
+        print(len(list(model.named_parameters())), len(optimizer_grouped_parameters))
+
+    max_num_iter = max(task_num_iters.values())
+    max_batch_size = max(task_batch_size.values())
+
 
     if default_gpu:
         print("***** Running training *****")
         print("  Num Iters: ", task_num_iters)
         print("  Batch size: ", task_batch_size)
         print("  Num steps: %d" %num_train_optimization_steps)
+
 
     startIterID = 0
     # initialize the data iteration.
@@ -384,10 +388,18 @@ def main():
                 # if iterId % task_interval[task_id] == 0:
                     loss, score = ForwardModelsTrain(args, task_cfg, device, task_id, task_count, task_iter_train, task_dataloader_train, model, task_losses, task_start_iter)
                     loss = loss * loss_scale[task_id]
-                    if args.gradient_accumulation_steps > 1:
-                        loss = loss / args.gradient_accumulation_steps 
+                    delay_unscale = (step + 1) % args.gradient_accumulation_steps != 0
+                    with amp.scale_loss(loss, optimizer, delay_unscale=delay_unscale
+                                    ) as scaled_loss:
+                        scaled_loss.backward()
+                        if not delay_unscale:
+                            # gather gradients from every processes
+                            # do this before unscaling to make sure every process uses
+                            # the same gradient scale
+                            grads = [p.grad.data for p in model.parameters()
+                                     if p.requires_grad and p.grad is not None]
+                            all_reduce_and_rescale_tensors(grads, float(1))
 
-                    loss.backward()
                     if (step + 1) % args.gradient_accumulation_steps == 0:
                         optimizer.step()
                         model.zero_grad()
@@ -402,11 +414,12 @@ def main():
         # when run evaluate, we run each task sequentially. 
         for task_id in task_ids:
             for i, batch in enumerate(task_dataloader_val[task_id]):
-                loss, score, batch_size = ForwardModelsVal(args, task_cfg, device, task_id, batch, model, task_losses)
-                tbLogger.step_val(epochId, float(loss), float(score), task_id, batch_size, 'val')
-                if default_gpu:
-                    sys.stdout.write('%d/%d\r' % (i, len(task_dataloader_val[task_id])))
-                    sys.stdout.flush()
+                with torch.no_grad():
+                    loss, score, batch_size = ForwardModelsVal(args, task_cfg, device, task_id, batch, model, task_losses)
+                    tbLogger.step_val(epochId, float(loss), float(score), task_id, batch_size, 'val')
+                    if default_gpu:
+                        sys.stdout.write('%d/%d\r' % (i, len(task_dataloader_val[task_id])))
+                        sys.stdout.flush()
         
         ave_score = tbLogger.showLossVal()
         if args.lr_scheduler == 'automatic':

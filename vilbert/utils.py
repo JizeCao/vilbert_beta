@@ -13,6 +13,8 @@ import tempfile
 from urllib.parse import urlparse
 
 import boto3
+import torch
+import math
 import requests
 from botocore.exceptions import ClientError
 from tqdm import tqdm
@@ -76,7 +78,7 @@ class tbLogger(object):
         self.task_loss[task_id] += loss
         self.task_loss_tmp[task_id] += loss
         self.task_score_tmp[task_id] += score
-        self.task_norm_tmp[task_id] += norm
+        self.task_norm_tmp[task_id] += norm if norm is not None else 0.
         self.task_step[task_id] += self.gradient_accumulation_steps
         self.task_step_tmp[task_id] += self.gradient_accumulation_steps
         self.epochId = epochId
@@ -338,6 +340,60 @@ def read_set_from_file(filename):
         for line in file_:
             collection.add(line.rstrip())
     return collection
+
+
+
+def all_reduce_and_rescale_tensors(tensors, rescale_denom,
+                                   buffer_size=10485760):
+    """All-reduce and rescale tensors in chunks of the specified size.
+    Args:
+        tensors: list of Tensors to all-reduce
+        rescale_denom: denominator for rescaling summed Tensors
+        buffer_size: all-reduce chunk size in bytes
+    """
+    # buffer size in bytes, determine equiv. # of elements based on data type
+    buffer_t = tensors[0].new(
+        math.ceil(buffer_size / tensors[0].element_size())).zero_()
+    buffer = []
+
+    def all_reduce_buffer():
+        # copy tensors into buffer_t
+        offset = 0
+        for t in buffer:
+            numel = t.numel()
+            buffer_t[offset:offset+numel].copy_(t.view(-1))
+            offset += numel
+
+        # all-reduce and rescale
+        torch.distributed.all_reduce(buffer_t[:offset])
+        buffer_t.div_(rescale_denom)
+
+        # copy all-reduced buffer back into tensors
+        offset = 0
+        for t in buffer:
+            numel = t.numel()
+            t.view(-1).copy_(buffer_t[offset:offset+numel])
+            offset += numel
+
+    filled = 0
+    for t in tensors:
+        sz = t.numel() * t.element_size()
+        if sz > buffer_size:
+            # tensor is bigger than buffer, all-reduce and rescale directly
+            torch.distributed.all_reduce(t)
+            t.div_(rescale_denom)
+        elif filled + sz > buffer_size:
+            # buffer is full, all-reduce and replace buffer with grad
+            all_reduce_buffer()
+            buffer = [t]
+            filled = sz
+        else:
+            # add tensor to buffer
+            buffer.append(t)
+            filled += sz
+
+    if len(buffer) > 0:
+        all_reduce_buffer()
 
 def get_file_extension(path, dot=True, lower=True):
     ext = os.path.splitext(path)[1]

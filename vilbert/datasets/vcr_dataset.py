@@ -49,7 +49,7 @@ def _load_annotationsQ_A(annotations_jsonpath, split):
             img_id = _converId(annotation["img_id"])
             anno_id = int(annotation["annot_id"].split('-')[1])
             entries.append(
-                {"question": question, 'answers':annotation["answer_choices"], "metadata_fn": annotation["metadata_fn"], 'target':ans_label, 'img_id':img_id, 'anno_id':anno_id}
+                {"question": question, 'answers':annotation["answer_choices"], "metadata_fn": annotation["metadata_fn"], 'target':ans_label, 'img_id':img_id, 'anno_id':anno_id, 'objects': annotation['objects']}
             )
 
     return entries
@@ -69,7 +69,7 @@ def _load_annotationsQA_R(annotations_jsonpath, split):
                     ans_label = 0
                     anno_id = int(annotation["annot_id"].split('-')[1])
                     entries.append(
-                        {"question": question, 'answers':annotation["rationale_choices"], "metadata_fn": annotation["metadata_fn"], 'target':ans_label, 'img_id':img_id}
+                        {"question": question, 'answers':annotation["rationale_choices"], "metadata_fn": annotation["metadata_fn"], 'target':ans_label, 'img_id':img_id, 'objects': annotation['objects']}
                     )
             else:
                 det_names = ""
@@ -79,7 +79,7 @@ def _load_annotationsQA_R(annotations_jsonpath, split):
                 img_id = _converId(annotation["img_id"])
                 anno_id = int(annotation["annot_id"].split('-')[1])
                 entries.append(
-                    {"question": question, 'answers':annotation["rationale_choices"], "metadata_fn": annotation["metadata_fn"], 'target':ans_label, 'img_id':img_id, 'anno_id':anno_id}
+                    {"question": question, 'answers':annotation["rationale_choices"], "metadata_fn": annotation["metadata_fn"], 'target':ans_label, 'img_id':img_id, 'anno_id':anno_id, 'objects': annotation['objects']}
                 )
 
     return entries
@@ -97,7 +97,7 @@ class VCRDataset(Dataset):
         padding_index: int = 0,
         max_seq_length: int = 40,
         max_region_num: int = 60,
-        pointer_sensitive = False
+        pointer_sensitive: bool = True
     ):
         # All the keys in `self._entries` would be present in `self._image_features_reader`
         if task == 'VCR_Q-A':
@@ -144,11 +144,11 @@ class VCRDataset(Dataset):
         """
         count = 0
         for entry in self._entries:
-            metadata_fn = json.load(open(os.path.join('data/VCR/vcr1images', entry["metadata_fn"]), 'r'))
+            metadata_fn = json.load(open(os.path.join('/datadrive_d/image/vcr1images', entry["metadata_fn"]), 'r'))
             det_names = metadata_fn["names"]
             random_names = self.generate_random_name(det_names)
             # replace with name
-            tokens_a, mask_a = self.replace_det_with_name(entry["question"], random_names)
+            tokens_a, mask_a = self.replace_det_with_name(entry["question"], random_names, objects=entry['objects'])
             
             input_ids_all = []
             co_attention_mask_all = []
@@ -156,7 +156,7 @@ class VCRDataset(Dataset):
             segment_ids_all = []
 
             for answer in entry["answers"]:
-                tokens_b, mask_b = self.replace_det_with_name(answer, random_names)
+                tokens_b, mask_b = self.replace_det_with_name(answer, random_names, objects=entry['objects'])
 
                 self._truncate_seq_pair(tokens_a, tokens_b, mask_a, mask_b, self._max_caption_length - 3)
 
@@ -231,7 +231,7 @@ class VCRDataset(Dataset):
 
         return random_name
 
-    def replace_det_with_name(self, inputs, random_names):
+    def replace_det_with_name(self, inputs, random_names, objects):
         tokens = []
         mask = []
         for w in inputs:
@@ -243,7 +243,10 @@ class VCRDataset(Dataset):
                 tokens += word_token
             else:
                 for idx in w:
-                    word = random_names[idx]
+                    if objects[idx] != 'person':
+                        word = objects[idx]
+                    else:
+                        word = random_names[idx]
                     word_token = self._tokenizer.tokenize(word)
                     mask += [idx] * len(word_token)
                     tokens += word_token
@@ -291,7 +294,7 @@ class VCRDataset(Dataset):
         gt_features, gt_num_boxes, gt_boxes, _ = self._gt_image_features_reader[image_id]
 
         # merge two features for whole image feat vector (which is calculated through the image feat)
-        features[0] = (features[0] * num_boxes + gt_features[0] * gt_num_boxes) / (num_boxes + gt_num_boxes)
+        gt_features[0] = (features[0] * num_boxes + gt_features[0] * gt_num_boxes) / (num_boxes + gt_num_boxes)
 
         # merge two boxes, and assign the labels. 
         gt_boxes = gt_boxes[1:gt_num_boxes]
@@ -308,8 +311,9 @@ class VCRDataset(Dataset):
         features = features[:num_box_preserve]
 
         # concatenate the boxes
-        mix_boxes = np.concatenate((boxes, gt_boxes), axis=0)
-        mix_features = np.concatenate((features, gt_features), axis=0)
+        # gt features first
+        mix_boxes = np.concatenate((gt_boxes, boxes), axis=0)
+        mix_features = np.concatenate((gt_features, features), axis=0)
         mix_num_boxes = num_box_preserve + int(gt_num_boxes)
         
         image_mask = [1] * (mix_num_boxes)
@@ -333,10 +337,7 @@ class VCRDataset(Dataset):
         target = int(entry["target"])
 
         # TODO aligned features
-        # if self._pointer_sensitive:
-        #     aligned_visual_feat = self._get_aligned_visual_feat(entry["co_attention_mask"], features)
-        # else:
-        #     aligned_visual_feat = None
+        qa_tags = torch.LongTensor(entry['co_attention_mask']) + 1
 
         if self._split == 'test' or self._split == 'val':
             anno_id = entry["anno_id"]
@@ -352,9 +353,8 @@ class VCRDataset(Dataset):
                 if idx != -1 and idx+num_box_preserve < self._max_region_num:
                     co_attention_mask[ii, idx+num_box_preserve, jj] = 1
 
-        return features, spatials, image_mask, input_ids, target, input_mask, segment_ids, co_attention_mask, anno_id
-        # return features, spatials, image_mask, input_ids, target, input_mask, segment_ids, co_attention_mask, anno_id, \
-        #        aligned_visual_feat
+        # return features, spatials, image_mask, input_ids, target, input_mask, segment_ids, co_attention_mask, anno_id
+        return features, spatials, image_mask, input_ids, target, input_mask, segment_ids, co_attention_mask, anno_id, qa_tags
 
     def __len__(self):
         return len(self._entries)

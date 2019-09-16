@@ -17,8 +17,8 @@ from torch import nn
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 from vilbert.utils import cached_path
-from pytorch_pretrained_bert.modeling import BertConfig
 import pdb
+# from pytorch_pretrained_bert.modeling import BertConfig
 from torch.nn.utils.weight_norm import weight_norm
 
 # from .file_utils import cached_path
@@ -46,6 +46,27 @@ def gelu(x):
     """
     return x * 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
 
+def _collect_obj_reps(span_tags, object_reps, zero_out=True):
+    """
+    Collect span-level object representations
+    :param span_tags: [batch_size, ..leading_dims.., L]
+    :param object_reps: [batch_size, max_num_objs_per_batch, obj_dim]
+    :return:
+    """
+    span_tags_fixed = torch.clamp(span_tags, min=0)  # In case there were masked values here
+    row_id = span_tags_fixed.new_zeros(span_tags_fixed.shape)
+    row_id_broadcaster = torch.arange(0, row_id.shape[0], step=1, device=row_id.device)[:, None]
+    zero_out_obj_reps = object_reps.clone()
+    # Zero out embedding where the corresponding text is non-pointer
+    if zero_out:
+        zero_out_obj_reps[:, 0, :].fill_(0.)
+    # Add extra diminsions to the row broadcaster so it matches row_id
+    leading_dims = len(span_tags.shape) - 2
+    for i in range(leading_dims):
+        row_id_broadcaster = row_id_broadcaster[..., None]
+    row_id += row_id_broadcaster
+    return zero_out_obj_reps[row_id.view(-1), span_tags_fixed.view(-1)].view(*span_tags_fixed.shape, -1)
+
 
 def swish(x):
     return x * torch.sigmoid(x)
@@ -71,6 +92,102 @@ except ImportError:
             s = (x - u).pow(2).mean(-1, keepdim=True)
             x = (x - u) / torch.sqrt(s + self.variance_epsilon)
             return self.weight * x + self.bias
+
+
+class BertConfig(object):
+    """Configuration class to store the configuration of a `BertModel`.
+    """
+    def __init__(self,
+                 vocab_size_or_config_json_file,
+                 hidden_size=768,
+                 num_hidden_layers=12,
+                 num_attention_heads=12,
+                 intermediate_size=3072,
+                 hidden_act="gelu",
+                 hidden_dropout_prob=0.1,
+                 attention_probs_dropout_prob=0.1,
+                 max_position_embeddings=512,
+                 type_vocab_size=2,
+                 initializer_range=0.02,
+                 pointer_sensitive=False):
+        """Constructs BertConfig.
+
+        Args:
+            vocab_size_or_config_json_file: Vocabulary size of `inputs_ids` in `BertModel`.
+            hidden_size: Size of the encoder layers and the pooler layer.
+            num_hidden_layers: Number of hidden layers in the Transformer encoder.
+            num_attention_heads: Number of attention heads for each attention layer in
+                the Transformer encoder.
+            intermediate_size: The size of the "intermediate" (i.e., feed-forward)
+                layer in the Transformer encoder.
+            hidden_act: The non-linear activation function (function or string) in the
+                encoder and pooler. If string, "gelu", "relu" and "swish" are supported.
+            hidden_dropout_prob: The dropout probabilitiy for all fully connected
+                layers in the embeddings, encoder, and pooler.
+            attention_probs_dropout_prob: The dropout ratio for the attention
+                probabilities.
+            max_position_embeddings: The maximum sequence length that this model might
+                ever be used with. Typically set this to something large just in case
+                (e.g., 512 or 1024 or 2048).
+            type_vocab_size: The vocabulary size of the `token_type_ids` passed into
+                `BertModel`.
+            initializer_range: The sttdev of the truncated_normal_initializer for
+                initializing all weight matrices.
+        """
+        if isinstance(vocab_size_or_config_json_file, str) or (sys.version_info[0] == 2
+                        and isinstance(vocab_size_or_config_json_file, unicode)):
+            with open(vocab_size_or_config_json_file, "r", encoding='utf-8') as reader:
+                json_config = json.loads(reader.read())
+            for key, value in json_config.items():
+                self.__dict__[key] = value
+        elif isinstance(vocab_size_or_config_json_file, int):
+            self.vocab_size = vocab_size_or_config_json_file
+            self.hidden_size = hidden_size
+            self.num_hidden_layers = num_hidden_layers
+            self.num_attention_heads = num_attention_heads
+            self.hidden_act = hidden_act
+            self.intermediate_size = intermediate_size
+            self.hidden_dropout_prob = hidden_dropout_prob
+            self.attention_probs_dropout_prob = attention_probs_dropout_prob
+            self.max_position_embeddings = max_position_embeddings
+            self.type_vocab_size = type_vocab_size
+            self.initializer_range = initializer_range
+            self.pointer_sensitive = pointer_sensitive
+        else:
+            raise ValueError("First argument must be either a vocabulary size (int)"
+                             "or the path to a pretrained model config file (str)")
+
+    @classmethod
+    def from_dict(cls, json_object):
+        """Constructs a `BertConfig` from a Python dictionary of parameters."""
+        config = BertConfig(vocab_size_or_config_json_file=-1)
+        for key, value in json_object.items():
+            config.__dict__[key] = value
+        return config
+
+    @classmethod
+    def from_json_file(cls, json_file):
+        """Constructs a `BertConfig` from a json file of parameters."""
+        with open(json_file, "r", encoding='utf-8') as reader:
+            text = reader.read()
+        return cls.from_dict(json.loads(text))
+
+    def __repr__(self):
+        return str(self.to_json_string())
+
+    def to_dict(self):
+        """Serializes this instance to a Python dictionary."""
+        output = copy.deepcopy(self.__dict__)
+        return output
+
+    def to_json_string(self):
+        """Serializes this instance to a JSON string."""
+        return json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n"
+
+    def to_json_file(self, json_file_path):
+        """ Save this instance to a json file."""
+        with open(json_file_path, "w", encoding='utf-8') as writer:
+            writer.write(self.to_json_string())
 
 
 class BertPreTrainedModel(nn.Module):
@@ -151,19 +268,19 @@ class BertPreTrainedModel(nn.Module):
         else:
             archive_file = pretrained_model_name_or_path
         # redirect to the cache, if necessary
-        try:
-            resolved_archive_file = cached_path(archive_file, cache_dir=cache_dir)
-        except EnvironmentError:
-            logger.error(
-                "Model name '{}' was not found in model name list ({}). "
-                "We assumed '{}' was a path or url but couldn't find any file "
-                "associated to this path or url.".format(
-                    pretrained_model_name_or_path,
-                    ", ".join(PRETRAINED_MODEL_ARCHIVE_MAP.keys()),
-                    archive_file,
-                )
-            )
-            return None
+        # try:
+        resolved_archive_file = cached_path(archive_file, cache_dir=cache_dir)
+        # except EnvironmentError:
+        #     logger.error(
+        #         "Model name '{}' was not found in model name list ({}). "
+        #         "We assumed '{}' was a path or url but couldn't find any file "
+        #         "associated to this path or url.".format(
+        #             pretrained_model_name_or_path,
+        #             ", ".join(PRETRAINED_MODEL_ARCHIVE_MAP.keys()),
+        #             archive_file,
+        #         )
+        #     )
+        #     return None
 
         if resolved_archive_file == archive_file:
             logger.info("loading archive file {}".format(archive_file))
@@ -277,20 +394,31 @@ class BertPreTrainedModel(nn.Module):
 class BertEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings.
     """
-    def __init__(self, config):
+
+    def __init__(self, config: BertConfig):
         super(BertEmbeddings, self).__init__()
-        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=0)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size, padding_idx=0)
-        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size, padding_idx=0)
+        self.word_embeddings = nn.Embedding(
+            config.vocab_size, config.hidden_size, padding_idx=0
+        )
+        self.position_embeddings = nn.Embedding(
+            config.max_position_embeddings, config.hidden_size
+        )
+        self.token_type_embeddings = nn.Embedding(
+            config.type_vocab_size, config.hidden_size
+        )
+        # if config.pointer_sensitive:
+        #     self.vToL = nn.Linear(config.v_hidden_size, config.hidden_size)
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=1e-12)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, input_ids, token_type_ids=None):
+    def forward(self, input_ids, token_type_ids=None, corr_visual_feats=None):
         seq_length = input_ids.size(1)
-        position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
+        position_ids = torch.arange(
+            seq_length, dtype=torch.long, device=input_ids.device
+        )
         position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
         if token_type_ids is None:
             token_type_ids = torch.zeros_like(input_ids)
@@ -298,8 +426,9 @@ class BertEmbeddings(nn.Module):
         words_embeddings = self.word_embeddings(input_ids)
         position_embeddings = self.position_embeddings(position_ids)
         token_type_embeddings = self.token_type_embeddings(token_type_ids)
-
         embeddings = words_embeddings + position_embeddings + token_type_embeddings
+        if corr_visual_feats is not None:
+            embeddings = embeddings + corr_visual_feats
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings
@@ -656,6 +785,7 @@ class BertModel(BertPreTrainedModel):
         self.embeddings = BertEmbeddings(config)
         self.encoder = BertEncoder(config)
         self.pooler = BertPooler(config)
+        self.mix_pointer_fts = config.pointer_sensitive
         self.apply(self.init_bert_weights)
 
     def forward(
@@ -667,6 +797,7 @@ class BertModel(BertPreTrainedModel):
         attention_mask=None,
         image_attention_mask=None,
         output_all_encoded_layers=True,
+        qa_tags=None
     ):
 
         if attention_mask is None:
@@ -702,8 +833,10 @@ class BertModel(BertPreTrainedModel):
         extended_image_attention_mask = (1.0 - extended_image_attention_mask) * -10000.0
 
         img_embeding_output = self.image_embeddings(input_imgs, image_loc, image_token_type_ids)
-        
-        embedding_output = self.embeddings(input_txt, token_type_ids)
+        corr_img_embedding = None
+        if self.mix_pointer_fts:
+            corr_img_embedding = _collect_obj_reps(qa_tags, img_embeding_output)
+        embedding_output = self.embeddings(input_txt, token_type_ids, corr_visual_feats=corr_img_embedding)
 
         embedding_output = torch.cat([embedding_output, img_embeding_output], dim=1)
         extended_attention_mask = torch.cat([extended_attention_mask, extended_image_attention_mask], dim=3)
@@ -834,9 +967,12 @@ class BaseBertForVLTasks(BertPreTrainedModel):
         self.num_labels = num_labels
         self.bert = BertModel(config)
         self.dropout = nn.Dropout(dropout_prob)
+        self.mix_lang_visual_feat = config.pointer_sensitive
         self.cls = BertPreTrainingHeads(
             config, self.bert.embeddings.word_embeddings.weight
         )
+        if config.pointer_sensitive:
+            print('Pointer position sensitive to its corresponding visual features')
         self.vil_prediction = SimpleClassifier(config.hidden_size, config.hidden_size*2, num_labels, 0.5)
         # self.vil_prediction = nn.Linear(config.bi_hidden_size, num_labels)
         self.vil_logit = nn.Linear(config.hidden_size, 1)
@@ -854,6 +990,7 @@ class BaseBertForVLTasks(BertPreTrainedModel):
         image_attention_mask=None,
         co_attention_mask=None,
         output_all_encoded_layers=False,
+        qa_tags=None
     ):
         sequence_output, pooled_output = self.bert(
             input_txt,
@@ -863,6 +1000,7 @@ class BaseBertForVLTasks(BertPreTrainedModel):
             attention_mask,
             image_attention_mask,
             output_all_encoded_layers=output_all_encoded_layers,
+            qa_tags=qa_tags
         )
 
         sequence_output_v = sequence_output[:,input_txt.size(1):]

@@ -299,7 +299,7 @@ class BertEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings.
     """
 
-    def __init__(self, config):
+    def __init__(self, config: BertConfig):
         super(BertEmbeddings, self).__init__()
         self.word_embeddings = nn.Embedding(
             config.vocab_size, config.hidden_size, padding_idx=0
@@ -310,13 +310,15 @@ class BertEmbeddings(nn.Module):
         self.token_type_embeddings = nn.Embedding(
             config.type_vocab_size, config.hidden_size
         )
+        if config.pointer_sensitive:
+            self.vToL = nn.Linear(config.v_hidden_size, config.hidden_size)
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=1e-12)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, input_ids, token_type_ids=None):
+    def forward(self, input_ids, token_type_ids=None, corr_visual_feats=None):
         seq_length = input_ids.size(1)
         position_ids = torch.arange(
             seq_length, dtype=torch.long, device=input_ids.device
@@ -328,8 +330,9 @@ class BertEmbeddings(nn.Module):
         words_embeddings = self.word_embeddings(input_ids)
         position_embeddings = self.position_embeddings(position_ids)
         token_type_embeddings = self.token_type_embeddings(token_type_ids)
-
         embeddings = words_embeddings + position_embeddings + token_type_embeddings
+        if corr_visual_feats is not None:
+            embeddings = embeddings + self.vToL(corr_visual_feats)
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings
@@ -1313,11 +1316,10 @@ class BertModel(BertPreTrainedModel):
         self.encoder = BertEncoder(config)
         self.t_pooler = BertTextPooler(config)
         self.v_pooler = BertImagePooler(config)
-        if config.pointer_sensitive:
-            self.fuse_pointer_feat = True
-            self.vTol = nn.Linear(config.v_hidden_size, config.hidden_size)
-
         self.apply(self.init_bert_weights)
+
+    def get_visual_embedding(self, input_imgs, image_loc):
+        return self.v_embeddings(input_imgs, image_loc)
 
     def forward(
         self,
@@ -1330,7 +1332,8 @@ class BertModel(BertPreTrainedModel):
         co_attention_mask=None,
         output_all_encoded_layers=False,
         output_all_attention_masks=False,
-        correspond_pointer_feat=None
+        v_embedding_output=None,
+        corr_visual_feats=None
     ):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_txt)
@@ -1375,11 +1378,10 @@ class BertModel(BertPreTrainedModel):
             dtype=next(self.parameters()).dtype
         )  # fp16 compatibility
 
-        embedding_output = self.embeddings(input_txt, token_type_ids)
-        if correspond_pointer_feat is not None and self.fuse_pointer_feat:
-            embedding_output = embedding_output + self.vTol(correspond_pointer_feat)
+        embedding_output = self.embeddings(input_txt, token_type_ids, corr_visual_feats=corr_visual_feats)
 
-        v_embedding_output = self.v_embeddings(input_imgs, image_loc)
+        if v_embedding_output is None:
+            v_embedding_output = self.get_visual_embedding(input_imgs=input_imgs, image_loc=image_loc)
 
         encoded_layers_t, encoded_layers_v, all_attention_mask = self.encoder(
             embedding_output,
@@ -1510,8 +1512,9 @@ class BertForMultiModalPreTraining(BertPreTrainedModel):
             return prediction_scores_t, prediction_scores_v, seq_relationship_score, all_attention_mask
 
 class VILBertForVLTasks(BertPreTrainedModel):
-    def __init__(self, config, num_labels, dropout_prob=0.1, default_gpu=True):
+    def __init__(self, config: BertConfig, num_labels, dropout_prob=0.1, default_gpu=True):
         super(VILBertForVLTasks, self).__init__(config)
+        self.mix_lang_visual_feat = config.pointer_sensitive
         self.num_labels = num_labels
         self.bert = BertModel(config)
         self.dropout = nn.Dropout(dropout_prob)
@@ -1526,6 +1529,25 @@ class VILBertForVLTasks(BertPreTrainedModel):
         self.fusion_method = config.fusion_method
         self.apply(self.init_bert_weights)
 
+    def _collect_obj_reps(self, span_tags, object_reps):
+        """
+        Collect span-level object representations
+        :param span_tags: [batch_size, ..leading_dims.., L]
+        :param object_reps: [batch_size, max_num_objs_per_batch, obj_dim]
+        :return:
+        """
+        span_tags_fixed = torch.clamp(span_tags, min=0)  # In case there were masked values here
+        row_id = span_tags_fixed.new_zeros(span_tags_fixed.shape)
+        row_id_broadcaster = torch.arange(0, row_id.shape[0], step=1, device=row_id.device)[:, None]
+        zero_out_obj_reps = object_reps.clone()
+        zero_out_obj_reps[:, 0, :].fill_(0.)
+        # Add extra diminsions to the row broadcaster so it matches row_id
+        leading_dims = len(span_tags.shape) - 2
+        for i in range(leading_dims):
+            row_id_broadcaster = row_id_broadcaster[..., None]
+        row_id += row_id_broadcaster
+        return zero_out_obj_reps[row_id.view(-1), span_tags_fixed.view(-1)].view(*span_tags_fixed.shape, -1)
+
     def forward(
         self,
         input_txt,
@@ -1536,8 +1558,15 @@ class VILBertForVLTasks(BertPreTrainedModel):
         image_attention_mask=None,
         co_attention_mask=None,
         output_all_encoded_layers=False,
-        correspond_pointer_feat=None
+        qa_tags=None
     ):
+
+        v_embedding_output = None
+        sequence_visual_feats = None
+        if self.mix_lang_visual_feat:
+            v_embedding_output = self.bert.get_visual_embedding(input_imgs, image_loc)
+            sequence_visual_feats = self._collect_obj_reps(qa_tags, v_embedding_output)
+
         sequence_output_t, sequence_output_v, pooled_output_t, pooled_output_v, _ = self.bert(
             input_txt,
             input_imgs,
@@ -1547,7 +1576,8 @@ class VILBertForVLTasks(BertPreTrainedModel):
             image_attention_mask,
             co_attention_mask,
             output_all_encoded_layers=False,
-            correspond_pointer_feat=correspond_pointer_feat
+            v_embedding_output=v_embedding_output,
+            corr_visual_feats=sequence_visual_feats
         )
 
         vil_prediction = 0

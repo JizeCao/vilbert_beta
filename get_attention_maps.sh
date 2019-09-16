@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 python attention_visualization.py \
+CUDA_VISIBLE_DEVICES=2,3 python -m torch.distributed.launch --nproc_per_node=2 --nnodes=1 --node_rank=0 attention_visualization.py \
 --bert_model \
 bert-base-uncased \
 --batch_size \
-128 \
+32 \
 --from_pretrained \
 save/single_stream_baseline/best_cp.bin \
 --config_file \
-config/bert_base_6layer_6conect.json \
+config/bert_base_baseline.json \
 --task \
 1 \
 --split \

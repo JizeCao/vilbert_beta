@@ -310,7 +310,7 @@ def LoadDatasetEval(args, task_cfg, ids):
     for i, task_id in enumerate(ids):
         task = 'TASK' + task_id
         task_ids.append(task)
-        batch_size =  args.batch_size
+        batch_size = args.batch_size
         if args.local_rank != -1:
             batch_size = int(batch_size / dist.get_world_size())
 

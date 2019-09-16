@@ -12,4 +12,5 @@ config/bert_base_6layer_6conect.json \
 --task \
 1 \
 --split \
-train
+train \
+--baseline

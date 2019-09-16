@@ -490,7 +490,7 @@ class BertSelfAttention(nn.Module):
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
 
-    def forward(self, hidden_states, attention_mask):
+    def forward(self, hidden_states, attention_mask, ret_attention=False):
         mixed_query_layer = self.query(hidden_states)
         mixed_key_layer = self.key(hidden_states)
         mixed_value_layer = self.value(hidden_states)
@@ -510,12 +510,16 @@ class BertSelfAttention(nn.Module):
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
+        # TODO: check whether eval mode cancel this dropout elimination
         attention_probs = self.dropout(attention_probs)
 
         context_layer = torch.matmul(attention_probs, value_layer)
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
+
+        if ret_attention:
+            return context_layer, attention_probs
         return context_layer
 
 
@@ -539,10 +543,16 @@ class BertAttention(nn.Module):
         self.self = BertSelfAttention(config)
         self.output = BertSelfOutput(config)
 
-    def forward(self, input_tensor, attention_mask):
-        self_output = self.self(input_tensor, attention_mask)
+    def forward(self, input_tensor, attention_mask, ret_attention=False):
+        if ret_attention:
+            self_output, attention_map = self.self(input_tensor, attention_mask, ret_attention)
+        else:
+            self_output = self.self(input_tensor, attention_mask)
         attention_output = self.output(self_output, input_tensor)
-        return attention_output
+        if ret_attention:
+            return attention_output, attention_map
+        else:
+            return attention_output
 
 
 class BertIntermediate(nn.Module):
@@ -581,10 +591,15 @@ class BertLayer(nn.Module):
         self.intermediate = BertIntermediate(config)
         self.output = BertOutput(config)
 
-    def forward(self, hidden_states, attention_mask):
-        attention_output = self.attention(hidden_states, attention_mask)
+    def forward(self, hidden_states, attention_mask, ret_attention=False):
+        if ret_attention:
+            attention_output, attention_map = self.attention(hidden_states, attention_mask, ret_attention)
+        else:
+            attention_output = self.attention(hidden_states, attention_mask)
         intermediate_output = self.intermediate(attention_output)
         layer_output = self.output(intermediate_output, attention_output)
+        if ret_attention:
+            return layer_output, attention_map
         return layer_output
 
 
@@ -594,14 +609,21 @@ class BertEncoder(nn.Module):
         layer = BertLayer(config)
         self.layer = nn.ModuleList([copy.deepcopy(layer) for _ in range(config.num_hidden_layers)])
 
-    def forward(self, hidden_states, attention_mask, output_all_encoded_layers=True):
+    def forward(self, hidden_states, attention_mask, output_all_encoded_layers=True, ret_attention=False):
         all_encoder_layers = []
+        all_attention_maps = []
         for layer_module in self.layer:
-            hidden_states = layer_module(hidden_states, attention_mask)
+            if ret_attention:
+                hidden_states, attention_maps = layer_module(hidden_states, attention_mask, ret_attention)
+                all_attention_maps.append(attention_maps)
+            else:
+                hidden_states = layer_module(hidden_states, attention_mask)
             if output_all_encoded_layers:
                 all_encoder_layers.append(hidden_states)
         if not output_all_encoded_layers:
             all_encoder_layers.append(hidden_states)
+        if ret_attention:
+            return all_encoder_layers, all_attention_maps
         return all_encoder_layers
 
 
@@ -797,7 +819,8 @@ class BertModel(BertPreTrainedModel):
         attention_mask=None,
         image_attention_mask=None,
         output_all_encoded_layers=True,
-        qa_tags=None
+        qa_tags=None,
+        ret_attention = False
     ):
 
         if attention_mask is None:
@@ -841,15 +864,25 @@ class BertModel(BertPreTrainedModel):
         embedding_output = torch.cat([embedding_output, img_embeding_output], dim=1)
         extended_attention_mask = torch.cat([extended_attention_mask, extended_image_attention_mask], dim=3)
 
-        encoded_layers = self.encoder(embedding_output,
-                                      extended_attention_mask,
-                                      output_all_encoded_layers=output_all_encoded_layers)
+        if ret_attention:
+            encoded_layers, attention_maps = self.encoder(embedding_output,
+                                                          extended_attention_mask,
+                                                          output_all_encoded_layers=output_all_encoded_layers,
+                                                          ret_attention=ret_attention)
+        else:
+            encoded_layers = self.encoder(embedding_output,
+                                          extended_attention_mask,
+                                          output_all_encoded_layers=output_all_encoded_layers,
+                                          ret_attention=ret_attention)
 
         sequence_output = encoded_layers[-1]
         pooled_output = self.pooler(sequence_output)
         if not output_all_encoded_layers:
             encoded_layers = encoded_layers[-1]
-        return encoded_layers, pooled_output
+        if ret_attention:
+            return encoded_layers, pooled_output, attention_maps
+        else:
+            return encoded_layers, pooled_output
 
 class BertForMultiModalPreTraining(BertPreTrainedModel):
     """BERT model with multi modal pre-training heads.
@@ -922,19 +955,31 @@ class BertForMultiModalPreTraining(BertPreTrainedModel):
         masked_lm_labels=None,
         image_label=None,
         next_sentence_label=None,
+        ret_attention=False
     ):
-        # in this model, we first embed the images.
-
-        sequence_output, pooled_output = self.bert(
-            input_ids,
-            image_feat,
-            image_loc,
-            token_type_ids,
-            attention_mask,
-            image_attention_mask,
-            output_all_encoded_layers=False,
-        )
-
+        if ret_attention:
+            # in this model, we first embed the images.
+            sequence_output, pooled_output, attention_maps = self.bert(
+                input_ids,
+                image_feat,
+                image_loc,
+                token_type_ids,
+                attention_mask,
+                image_attention_mask,
+                output_all_encoded_layers=False,
+                ret_attention=ret_attention
+            )
+        else:
+            sequence_output, pooled_output = self.bert(
+                input_ids,
+                image_feat,
+                image_loc,
+                token_type_ids,
+                attention_mask,
+                image_attention_mask,
+                output_all_encoded_layers=False,
+                ret_attention=ret_attention
+            )
         prediction_scores_v, prediction_scores_t, seq_relationship_score = self.cls(sequence_output, pooled_output, input_ids.size(1), image_feat.size(1))
         
         if masked_lm_labels is not None and next_sentence_label is not None:
@@ -990,18 +1035,33 @@ class BaseBertForVLTasks(BertPreTrainedModel):
         image_attention_mask=None,
         co_attention_mask=None,
         output_all_encoded_layers=False,
-        qa_tags=None
+        qa_tags=None,
+        ret_attention=False
     ):
-        sequence_output, pooled_output = self.bert(
-            input_txt,
-            input_imgs,
-            image_loc,
-            token_type_ids,
-            attention_mask,
-            image_attention_mask,
-            output_all_encoded_layers=output_all_encoded_layers,
-            qa_tags=qa_tags
-        )
+        if ret_attention:
+            sequence_output, pooled_output, attention_maps = self.bert(
+                input_txt,
+                input_imgs,
+                image_loc,
+                token_type_ids,
+                attention_mask,
+                image_attention_mask,
+                output_all_encoded_layers=output_all_encoded_layers,
+                qa_tags=qa_tags,
+                ret_attention=ret_attention
+            )
+        else:
+            sequence_output, pooled_output = self.bert(
+                input_txt,
+                input_imgs,
+                image_loc,
+                token_type_ids,
+                attention_mask,
+                image_attention_mask,
+                output_all_encoded_layers=output_all_encoded_layers,
+                qa_tags=qa_tags,
+                ret_attention=ret_attention
+            )
 
         sequence_output_v = sequence_output[:,input_txt.size(1):]
         sequence_output_t = sequence_output[:,:input_txt.size(1)]
@@ -1021,7 +1081,10 @@ class BaseBertForVLTasks(BertPreTrainedModel):
         vision_logit = self.vision_logit(self.dropout(sequence_output_v)) + ((1.0 - image_attention_mask)* -10000.0).unsqueeze(2).to(dtype=next(self.parameters()).dtype)
         linguisic_logit = self.linguisic_logit(self.dropout(sequence_output_t))
 
-        return vil_prediction, vil_logit, vil_binary_prediction, vision_prediction, vision_logit, linguisic_prediction, linguisic_logit
+        if ret_attention:
+            return vil_prediction, vil_logit, vil_binary_prediction, vision_prediction, vision_logit, linguisic_prediction, linguisic_logit, attention_maps
+        else:
+            return vil_prediction, vil_logit, vil_binary_prediction, vision_prediction, vision_logit, linguisic_prediction, linguisic_logit
 
 class SimpleClassifier(nn.Module):
     def __init__(self, in_dim, hid_dim, out_dim, dropout):

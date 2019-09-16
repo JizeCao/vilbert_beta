@@ -360,7 +360,7 @@ def compute_score_with_logits(logits, labels):
     return scores
 
 def EvaluatingModel(args, task_cfg, device, task_id, batch, model, task_dataloader, task_losses, results, others, ret_attention=False, attentions=None):
-    print(device)
+    # print(device)
     batch = tuple(t.cuda(device=device, non_blocking=True) for t in batch)
     qa_tags = None
     if task_id in ['TASK1', 'TASK2']:

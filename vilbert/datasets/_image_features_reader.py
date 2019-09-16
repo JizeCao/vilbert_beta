@@ -112,6 +112,7 @@ class ImageFeaturesH5Reader(object):
                 image_h = int(item['image_h'])
                 image_w = int(item['image_w'])
                 num_boxes = int(item['num_boxes'])
+                print(type(item["features"]))
                 features = np.frombuffer(base64.b64decode(ast.literal_eval(item["features"])), dtype=np.float32).reshape(num_boxes, 2048)
                 boxes = np.frombuffer(base64.b64decode(ast.literal_eval(item['boxes'])), dtype=np.float32).reshape(num_boxes, 4)
                 g_feat = np.sum(features, axis=0) / num_boxes

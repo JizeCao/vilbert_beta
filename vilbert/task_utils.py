@@ -430,7 +430,11 @@ def EvaluatingModel(args, task_cfg, device, task_id, batch, model, task_dataload
             results.append({'question_id':question_id[i].item(), 'answer':[prob.item() for prob in probs[i]]})
             target_id = target[i]
             if attentions is not None:
-                attention_map = attention_maps[i][target].cpu().numpy()
+                try:
+                    attention_map = attention_maps[i][target].cpu().numpy()
+                except:
+                    print(target_id)
+                    print(attention_maps.shape)
                 attentions.append({'question_id': question_id[i].item(), 'target_id': target_id, 'attention_map': attention_map})
 
 

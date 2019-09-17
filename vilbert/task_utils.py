@@ -429,12 +429,13 @@ def EvaluatingModel(args, task_cfg, device, task_id, batch, model, task_dataload
         for i in range(vil_logit.size(0)):
             results.append({'question_id':question_id[i].item(), 'answer':[prob.item() for prob in probs[i]]})
             target_id = target[i]
+            print(type(attention_maps))
             if attentions is not None:
                 try:
                     attention_map = attention_maps[i][target].cpu().numpy()
                 except:
                     print(target_id)
-                    print(attention_maps.shape)
+                    print(attention_maps[i].shape)
                 attentions.append({'question_id': question_id[i].item(), 'target_id': target_id, 'attention_map': attention_map})
 
 
